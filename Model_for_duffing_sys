@@ -1,0 +1,295 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import math
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from torch.utils.data._utils.collate import default_collate
+import torch.nn.utils.rnn as rnn_utils
+
+def pad_collate(batch):
+    # Separate components of the batch
+    trajectories, Ts, params = zip(*batch)
+
+    # Pad trajectories with zeros
+    trajectories = rnn_utils.pad_sequence(trajectories, batch_first=True, padding_value=0)
+
+    # Apply default collate to Ts and params
+    Ts = default_collate(Ts)
+    params = default_collate(params)
+    
+    # Return the padded trajectories, Ts, and params
+    return trajectories, Ts, params # Added this line to return the values
+
+# Hyperparameters
+BATCH_SIZE = 64
+LEARNING_RATE = 0.001
+EPOCHS = 50
+D_MODEL = 64
+NHEAD = 4
+NUM_LAYERS = 6
+DIM_FCNN = 128
+DROPOUT = 0.1
+PATIENCE = 5  # For early stopping
+
+class SDEDataset(Dataset):
+    def __init__(self, csv_file):
+        self.data = pd.read_csv(csv_file)
+        self.param_names = self._get_param_names()
+        
+    def _get_param_names(self):
+        """Get parameter names based on system type"""
+        sample = self.data.iloc[0]
+        if 'r' in sample:  # Genetic toggle switch
+            return ['r', 'k', 'epsilon', 'alpha']
+        else:  # Duffing system
+            return ['gamma', 'epsilon', 'alpha']
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        sample = self.data.iloc[idx]
+        trajectory = torch.tensor(eval(sample['trajectory']), dtype=torch.float32)
+        T = torch.tensor(sample['T'], dtype=torch.float32).unsqueeze(0)
+        params = torch.tensor([sample[p] for p in self.param_names], dtype=torch.float32)
+        return trajectory, T, params
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # Get the current sequence length
+        seq_len = x.size(0)
+        # Slice the positional encoding to match the current sequence length
+        pe = self.pe[:seq_len, :].unsqueeze(1).repeat(1, x.size(1), 1)  # Add batch dimension and repeat
+        # Add the positional encoding to the input
+        x = x + pe
+        return x
+
+class TransformerPENN(nn.Module):
+    def __init__(self, num_params, max_seq_len=1500):
+        super().__init__()
+        
+        # Stage 1: Transformer Encoder
+        self.embedding = nn.Linear(1, D_MODEL)
+        self.pos_encoder = PositionalEncoding(D_MODEL, max_len=max_seq_len)
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=D_MODEL, 
+            nhead=NHEAD, 
+            dim_feedforward=DIM_FCNN,
+            dropout=DROPOUT
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=NUM_LAYERS)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Stage 2: FCNN
+        self.fc1 = nn.Linear(D_MODEL + 1, DIM_FCNN)
+        self.fc2 = nn.Linear(DIM_FCNN, DIM_FCNN)
+        self.fc3 = nn.Linear(DIM_FCNN, num_params)
+        self.elu = nn.ELU()
+        self.bn1 = nn.BatchNorm1d(DIM_FCNN)
+        
+    def forward(self, x, T):
+        batch_size = x.size(0)
+        x = x.unsqueeze(-1)
+        x = self.embedding(x)
+        x = x.permute(1, 0, 2)
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x)
+        x = x.permute(1, 2, 0)
+        x = self.pool(x).squeeze(-1)
+        y = torch.cat([x, T], dim=1)
+        y = self.fc1(y)
+        y = self.bn1(y)
+        y = self.elu(y)
+        y = self.fc2(y)
+        y = self.elu(y)
+        y = self.fc3(y)
+        return y
+
+class TrainingMonitor:
+    def __init__(self, param_names):
+        self.param_names = param_names
+        self.reset()
+        
+    def reset(self):
+        self.train_loss = []
+        self.val_loss = []
+        self.param_metrics = {p: defaultdict(list) for p in self.param_names}
+        self.best_loss = float('inf')
+        self.best_epoch = 0
+        self.lr_history = []
+        
+    def update(self, epoch, train_loss, val_loss, lr, y_true=None, y_pred=None):
+        self.train_loss.append(train_loss)
+        self.val_loss.append(val_loss)
+        self.lr_history.append(lr)
+        
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.best_epoch = epoch
+        
+        # Calculate parameter-wise metrics if provided
+        if y_true is not None and y_pred is not None:
+            y_true = y_true.cpu().numpy()
+            y_pred = y_pred.cpu().numpy()
+            
+            for i, param in enumerate(self.param_names):
+                errors = np.abs(y_true[:, i] - y_pred[:, i])
+                self.param_metrics[param]['mean_abs_error'].append(np.mean(errors))
+                self.param_metrics[param]['std_abs_error'].append(np.std(errors))
+                self.param_metrics[param]['mean_pred'].append(np.mean(y_pred[:, i]))
+                self.param_metrics[param]['std_pred'].append(np.std(y_pred[:, i]))
+    
+    def should_stop(self, epoch):
+        return (epoch - self.best_epoch) >= PATIENCE
+    
+    def plot_losses(self):
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.plot(self.train_loss, label='Train Loss')
+        plt.plot(self.val_loss, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Training and Validation Loss')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(self.lr_history)
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule')
+        plt.tight_layout()
+        plt.show()
+    
+    def print_final_metrics(self):
+        print(f"\nBest Validation Loss: {self.best_loss:.4f} at epoch {self.best_epoch}")
+        print("\nParameter-wise Metrics:")
+        for param, metrics in self.param_metrics.items():
+            if metrics['mean_abs_error']:  # Only print if metrics were calculated
+                last_mae = metrics['mean_abs_error'][-1]
+                last_std = metrics['std_abs_error'][-1]
+                print(f"{param}: MAE = {last_mae:.4f} ± {last_std:.4f}")
+
+def train_model(model, train_loader, test_loader, system_name):
+    criterion = nn.L1Loss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, verbose=True)
+    
+    monitor = TrainingMonitor(train_loader.dataset.param_names)
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0.0
+        all_preds = []
+        all_targets = []
+        
+        # Training phase with progress bar
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", leave=False)
+        for trajectories, Ts, params in train_bar:
+            trajectories, Ts, params = trajectories.to(device), Ts.to(device), params.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(trajectories, Ts)
+            loss = criterion(outputs, params)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * trajectories.size(0)
+            all_preds.append(outputs.detach())
+            all_targets.append(params.detach())
+            train_bar.set_postfix(loss=loss.item())
+        
+        train_loss /= len(train_loader.dataset)
+        all_preds = torch.cat(all_preds)
+        all_targets = torch.cat(all_targets)
+        
+        # Validation phase with progress bar
+        model.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_targets = []
+        
+        val_bar = tqdm(test_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Val]", leave=False)
+        with torch.no_grad():
+            for trajectories, Ts, params in val_bar:
+                trajectories, Ts, params = trajectories.to(device), Ts.to(device), params.to(device)
+                outputs = model(trajectories, Ts)
+                loss = criterion(outputs, params)
+                val_loss += loss.item() * trajectories.size(0)
+                val_preds.append(outputs)
+                val_targets.append(params)
+                val_bar.set_postfix(loss=loss.item())
+        
+        val_loss /= len(test_loader.dataset)
+        val_preds = torch.cat(val_preds)
+        val_targets = torch.cat(val_targets)
+        
+        # Update learning rate
+        scheduler.step(val_loss)
+        
+        # Update monitor
+        monitor.update(epoch+1, train_loss, val_loss, optimizer.param_groups[0]['lr'], 
+                      all_targets, all_preds)
+        
+        # Print epoch summary
+        print(f"\nEpoch {epoch+1}/{EPOCHS} - "
+              f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+              f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Early stopping
+        if monitor.should_stop(epoch+1):
+            print(f"\nEarly stopping at epoch {epoch+1}")
+            break
+    
+    # Save best model
+    torch.save(model.state_dict(), f"{system_name}_best_model.pth")
+    
+    # Plot and print results
+    monitor.plot_losses()
+    monitor.print_final_metrics()
+    
+    return monitor
+
+def main():
+    # Load datasets
+    gene_train = SDEDataset('./data/gene_switch_train.csv')
+    gene_test = SDEDataset('./data/gene_switch_test.csv')
+    duffing_train = SDEDataset('./data/duffing_train.csv')
+    duffing_test = SDEDataset('./data/duffing_test.csv')
+    
+    # Create data loaders
+# Inside main() function, when creating DataLoaders:
+    gene_train_loader = DataLoader(gene_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, collate_fn=pad_collate)
+    gene_test_loader = DataLoader(gene_test, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, collate_fn=pad_collate)
+    duffing_train_loader = DataLoader(duffing_train, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, collate_fn=pad_collate)
+    duffing_test_loader = DataLoader(duffing_test, batch_size=BATCH_SIZE, num_workers=4, pin_memory=True, collate_fn=pad_collate)
+    
+    # Initialize models
+    gene_model = TransformerPENN(num_params=4).to(device)
+    duffing_model = TransformerPENN(num_params=3).to(device)
+    
+    # Train models
+    print("\n=== Training Genetic Toggle Switch Model ===")
+    gene_monitor = train_model(gene_model, gene_train_loader, gene_test_loader, "gene_switch")
+    
+    print("\n=== Training Duffing System Model ===")
+    duffing_monitor = train_model(duffing_model, duffing_train_loader, duffing_test_loader, "duffing")
+
+if __name__ == "__main__":
+    main()
