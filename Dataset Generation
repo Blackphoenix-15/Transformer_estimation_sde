@@ -1,0 +1,129 @@
+!pip install signalz
+import os
+import numpy as np
+import pandas as pd
+from signalz import signalz
+from tqdm import tqdm
+
+def generate_datasets():
+    """Generate datasets for both systems"""
+    os.makedirs('./data', exist_ok=True)
+
+    # Genetic Toggle Switch Dataset
+    print("Generating Genetic Toggle Switch Dataset...")
+    generate_system_dataset(
+        system='gene_switch',
+        param_ranges={
+            'r': [2, 10],
+            'k': [2, 20],
+            'epsilon': [0.02, 0.1],
+            'alpha': [1.2, 2]
+        },
+        T_range=[50, 100],
+        N_range=[500, 1000],
+        num_samples=4000,  # 3000 train + 1000 test
+        trajectory_generator=generate_gene_switch_trajectory
+    )
+
+    # Duffing System Dataset
+    print("\nGenerating Duffing System Dataset...")
+    generate_system_dataset(
+        system='duffing',
+        param_ranges={
+            'gamma': [0.5, 1],
+            'epsilon': [0.05, 0.5],
+            'alpha': [1.4, 2]
+        },
+        T_range=[50, 100],
+        N_range=[1000, 1500],
+        num_samples=4000,  # 3000 train + 1000 test
+        trajectory_generator=generate_duffing_trajectory
+    )
+
+def generate_system_dataset(system, param_ranges, T_range, N_range, num_samples, trajectory_generator):
+    """Generate dataset for a specific system"""
+    discard_T = 50  # Time to discard for stabilization
+    data = []
+
+    for _ in tqdm(range(num_samples)):
+        # Sample parameters
+        T = np.random.uniform(*T_range)
+        N = np.random.randint(*N_range)
+        dt = T / N
+        discard_N = int(discard_T / dt)
+
+        # Sample system parameters
+        params = {name: np.random.uniform(*range) for name, range in param_ranges.items()}
+
+        # Generate trajectory
+        if system == 'gene_switch':
+            traj = trajectory_generator(N+discard_N, dt, **params)
+            traj = traj[discard_N:]  # Discard initial transient
+        else:  # duffing
+            while True:
+                good, full_traj = trajectory_generator(N+discard_N, dt, **params)
+                if good:
+                    break
+            traj = full_traj[discard_N:]  # Discard initial transient and use only x coordinate
+
+        # Store sample
+        sample = {
+            'trajectory': traj.tolist(),
+            'T': T,
+            'N': N,
+            **params
+        }
+        data.append(sample)
+
+    # Convert to DataFrame and save
+    df = pd.DataFrame(data)
+    df.to_csv(f'./data/{system}_full_dataset.csv', index=False)
+    print(f"Saved {len(df)} samples to ./data/{system}_full_dataset.csv")
+
+    # Split into train/test (3000/1000)
+    train_df = df.iloc[:3000]
+    test_df = df.iloc[3000:4000]
+
+    train_df.to_csv(f'./data/{system}_train.csv', index=False)
+    test_df.to_csv(f'./data/{system}_test.csv', index=False)
+    print(f"Split into 3000 training and 1000 test samples")
+
+def generate_gene_switch_trajectory(N, dt, r, k, epsilon, alpha, x0=None):
+    """Generate trajectory for genetic toggle switch model"""
+    if x0 is None:
+        x0 = np.random.rand()
+
+    time_ratio = np.power(dt, 1.0/alpha)
+    dL = signalz.levy_noise(N, alpha, 0.0, 1.0, 0.)
+    data = np.zeros(N)
+    data[0] = x0
+
+    for i in range(N-1):
+        x = data[i]
+        gx = (2.0 * x**2 + 50.0 * x**4) / (25 + 29*x**2 + 52*x**4 + 4*x**6)
+        data[i+1] = x + (gx * k - r * x + 1) * dt + epsilon * time_ratio * dL[i]
+
+    return data
+
+def generate_duffing_trajectory(N, dt, gamma, epsilon, alpha):
+    """Generate trajectory for Duffing system"""
+    time_ratio = np.power(dt, 1.0/alpha)
+    dL = signalz.levy_noise(N, alpha, 0.0, 1.0, 0.)
+
+    x0, y0 = 0.01, 0.01
+    data = np.zeros((2, N))
+    data[:, 0] = [x0, y0]
+    THR = 10000  # Threshold for divergence
+
+    for i in range(N-1):
+        x, y = data[:, i]
+        if abs(x) > THR or abs(y) > THR:
+            return False, None
+
+        data[0, i+1] = x + y * dt
+        data[1, i+1] = y + (-gamma * y + x - x**3) * dt + epsilon * time_ratio * dL[i]
+
+    return True, data[0]  # Return only x coordinate
+
+if __name__ == '__main__':
+    generate_datasets()
