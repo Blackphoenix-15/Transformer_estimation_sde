@@ -1,0 +1,546 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import math
+import random
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression
+import seaborn as sns
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Hyperparameters
+BATCH_SIZE = 64
+EPOCHS = 100
+D_MODEL = 128
+NHEAD = 8
+NUM_LAYERS = 4
+DIM_FCNN = 256
+DROPOUT = 0.2
+PATIENCE = 15
+MAX_SEQ_LEN = 1500
+LR = 1e-4
+FOCUS_LR = 3e-4
+
+# Custom collate function
+def pad_collate(batch):
+    trajectories, Ts, params = zip(*batch)
+    lengths = [len(traj) for traj in trajectories]
+    trajectories = nn.utils.rnn.pad_sequence(trajectories, batch_first=True, padding_value=0)
+    Ts = torch.stack(Ts)
+    params = torch.stack(params)
+    return trajectories, Ts, params, lengths
+
+# Enhanced Dataset Class with Focused Augmentation
+class EnhancedGeneticToggleDataset(Dataset):
+    def __init__(self, csv_file, train=True):
+        self.data = pd.read_csv(csv_file)
+        self.train = train
+        self.param_names = ['r', 'k', 'epsilon', 'alpha']
+        self._compute_stats()
+        
+    def _compute_stats(self):
+        # Use ast.literal_eval for safety
+        all_trajs = np.concatenate([np.array(ast.literal_eval(traj)) for traj in self.data['trajectory']])  
+        self.traj_mean = all_trajs.mean()
+        self.traj_std = all_trajs.std()
+        
+        self.param_stats = {}
+        for param in self.param_names:
+            self.param_stats[param] = {
+                'mean': self.data[param].mean(),
+                'std': self.data[param].std(),
+                'min': self.data[param].min(),
+                'max': self.data[param].max()
+            }
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        sample = self.data.iloc[idx]
+        # Use ast.literal_eval for safety and specify np.float32 for NumPy array
+        trajectory = torch.tensor(np.array(ast.literal_eval(sample['trajectory']), dtype=np.float32))  
+        trajectory = (trajectory - self.traj_mean) / (self.traj_std + 1e-8)
+        
+        # Enhanced parameter-specific augmentation
+        if self.train:
+            # Base noise
+            trajectory += torch.randn_like(trajectory) * 0.02
+            
+            # Epsilon-focused augmentation
+            if random.random() < 0.7:
+                trajectory *= (0.9 + 0.2*random.random())  # Scale variation
+            
+            # Alpha-focused augmentation
+            if random.random() < 0.7:
+                trajectory = torch.roll(trajectory, shifts=random.randint(-10,10))
+        
+        # Normalized parameters
+        params = torch.tensor([
+            (sample['r'] - self.param_stats['r']['mean']) / self.param_stats['r']['std'],
+            (sample['k'] - self.param_stats['k']['mean']) / self.param_stats['k']['std'],
+            (sample['epsilon'] - 0.5) * 2,  # Scale to [-1,1]
+            (sample['alpha'] - 0.5) * 2      # Scale to [-1,1]
+        ], dtype=torch.float32)
+        
+        T = torch.tensor(sample['T'], dtype=torch.float32).unsqueeze(0)
+        
+        return trajectory, T, params
+
+# Enhanced Transformer with Specialized Heads
+class EnhancedGeneticTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # 1D Convolutional embedding
+        self.conv_embed = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, padding=3),
+            nn.GELU(),
+            nn.Conv1d(64, D_MODEL, kernel_size=5, padding=2),
+            nn.GELU()
+        )
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(D_MODEL, max_len=MAX_SEQ_LEN)
+        
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=D_MODEL, 
+            nhead=NHEAD, 
+            dim_feedforward=DIM_FCNN*2,
+            dropout=DROPOUT,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, NUM_LAYERS)
+        
+        # Attention pooling
+        self.attention_pool = nn.Sequential(
+            nn.Linear(D_MODEL, D_MODEL//2),
+            nn.Tanh(),
+            nn.Linear(D_MODEL//2, 1),
+            nn.Softmax(dim=1))
+        
+        # Shared base network
+        self.shared_fc = nn.Sequential(
+            nn.Linear(D_MODEL, DIM_FCNN),
+            nn.LayerNorm(DIM_FCNN),
+            nn.GELU(),
+            nn.Dropout(DROPOUT/2))
+        
+        # Parameter-specific heads
+        self.r_head = self._build_head()
+        self.k_head = self._build_head()
+        self.epsilon_head = self._build_epsilon_head()
+        self.alpha_head = self._build_alpha_head()
+    
+    def _build_head(self):
+        return nn.Sequential(
+            nn.Linear(DIM_FCNN + 1, DIM_FCNN//2),
+            nn.GELU(),
+            nn.Linear(DIM_FCNN//2, 1))
+    
+    def _build_epsilon_head(self):
+        return nn.Sequential(
+            nn.Linear(DIM_FCNN + 1, 128),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+            nn.Linear(64, 1))
+    
+    def _build_alpha_head(self):
+        return nn.Sequential(
+            nn.Linear(DIM_FCNN + 1, 256),
+            nn.GELU(),
+            nn.Dropout(0.4),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Linear(128, 1))
+    
+    def forward(self, x, T):
+        # Feature extraction
+        x = x.unsqueeze(1)
+        x = self.conv_embed(x).permute(0, 2, 1)
+        x = self.pos_encoder(x)
+        x = self.transformer(x)
+        
+        # Attention pooling
+        attn_weights = self.attention_pool(x)
+        context = torch.sum(x * attn_weights, dim=1)
+        shared_features = self.shared_fc(context)
+        
+        # Parameter predictions
+        r_input = torch.cat([shared_features, T], dim=1)
+        k_input = torch.cat([shared_features, T], dim=1)
+        epsilon_input = torch.cat([shared_features, T], dim=1)
+        alpha_input = torch.cat([shared_features, T], dim=1)
+        
+        r_pred = self.r_head(r_input)
+        k_pred = self.k_head(k_input)
+        epsilon_pred = self.epsilon_head(epsilon_input)
+        alpha_pred = self.alpha_head(alpha_input)
+        
+        return torch.cat([r_pred, k_pred, epsilon_pred, alpha_pred], dim=1)
+
+# Positional Encoding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        seq_len = x.size(1)
+        pe = self.pe[:seq_len, :].unsqueeze(0)
+        return x + pe
+
+# Hybrid Loss with Dynamic Weighting
+class DynamicWeightedLoss(nn.Module):
+    def __init__(self, base_weights):
+        super().__init__()
+        self.base_weights = torch.tensor(base_weights).to(device)
+        self.epoch = 0
+        
+    def update_epoch(self, epoch):
+        self.epoch = epoch
+        
+    def forward(self, inputs, targets):
+        # Dynamic weight adjustment
+        if self.epoch > EPOCHS//2:
+            focus_multiplier = torch.tensor([0.8, 0.9, 1.3, 1.2]).to(device)
+        else:
+            focus_multiplier = torch.tensor([1.0, 1.0, 1.0, 1.0]).to(device)
+            
+        weights = self.base_weights * focus_multiplier
+        
+        losses = []
+        for i in range(inputs.size(1)):
+            mae = F.l1_loss(inputs[:,i], targets[:,i])
+            mse = F.mse_loss(inputs[:,i], targets[:,i])
+            losses.append(weights[i] * (0.6*mae + 0.4*mse))
+        return torch.mean(torch.stack(losses))
+
+# Training Monitor with Enhanced Visualization
+class EnhancedTrainingMonitor:
+    def __init__(self, param_names):
+        self.param_names = param_names
+        self.reset()
+        
+    def reset(self):
+        self.train_loss = []
+        self.val_loss = []
+        self.best_loss = float('inf')
+        self.best_epoch = 0
+        self.lr_history = []
+        self.metrics = {
+            'train': {p: defaultdict(list) for p in self.param_names},
+            'val': {p: defaultdict(list) for p in self.param_names}
+        }
+    
+    def update(self, epoch, train_loss, val_loss, lr, y_true_train=None, y_pred_train=None, 
+               y_true_val=None, y_pred_val=None):
+        self.train_loss.append(train_loss)
+        self.val_loss.append(val_loss)
+        self.lr_history.append(lr)
+        
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.best_epoch = epoch
+        
+        if y_true_train is not None and y_pred_train is not None:
+            self._calculate_metrics(y_true_train, y_pred_train, 'train')
+        if y_true_val is not None and y_pred_val is not None:
+            self._calculate_metrics(y_true_val, y_pred_val, 'val')
+    
+    def _calculate_metrics(self, y_true, y_pred, phase):
+        y_true = y_true.cpu().numpy()
+        y_pred = y_pred.cpu().numpy()
+        
+        for i, param in enumerate(self.param_names):
+            true = y_true[:, i]
+            pred = y_pred[:, i]
+            
+            self.metrics[phase][param]['mae'].append(mean_absolute_error(true, pred))
+            self.metrics[phase][param]['mse'].append(mean_squared_error(true, pred))
+            self.metrics[phase][param]['r2'].append(r2_score(true, pred))
+            self.metrics[phase][param]['corr'].append(np.corrcoef(true, pred)[0, 1])
+    
+    def plot_diagnostics(self):
+        plt.figure(figsize=(20, 15))
+        
+        # Loss curves
+        plt.subplot(3, 2, 1)
+        plt.plot(self.train_loss, label='Train Loss')
+        plt.plot(self.val_loss, label='Validation Loss')
+        plt.axvline(self.best_epoch, color='r', linestyle='--', label='Best Model')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.title('Training Curves')
+        
+        # Learning rate
+        plt.subplot(3, 2, 2)
+        plt.plot(self.lr_history)
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.title('Learning Rate Schedule')
+        
+        # MAE by parameter
+        plt.subplot(3, 2, 3)
+        for param in self.param_names:
+            plt.plot(self.metrics['val'][param]['mae'], label=param)
+        plt.xlabel('Epoch')
+        plt.ylabel('MAE')
+        plt.legend()
+        plt.title('Validation MAE by Parameter')
+        
+        # R² by parameter
+        plt.subplot(3, 2, 4)
+        for param in self.param_names:
+            plt.plot(self.metrics['val'][param]['r2'], label=param)
+        plt.xlabel('Epoch')
+        plt.ylabel('R² Score')
+        plt.legend()
+        plt.title('Validation R² by Parameter')
+        
+        # Final predictions vs true values
+        plt.subplot(3, 2, 5)
+        val_preds = [self.metrics['val'][p]['pred'][-1] for p in self.param_names]
+        val_true = [self.metrics['val'][p]['true'][-1] for p in self.param_names]
+        for i, (pred, true) in enumerate(zip(val_preds, val_true)):
+            plt.scatter(true, pred, alpha=0.5, label=self.param_names[i])
+        plt.plot([min(val_true), max(val_true)], [min(val_true), max(val_true)], 'r--')
+        plt.xlabel('True Values')
+        plt.ylabel('Predictions')
+        plt.legend()
+        plt.title('Final Predictions vs True Values')
+        
+        # Error distributions
+        plt.subplot(3, 2, 6)
+        for i, param in enumerate(self.param_names):
+            errors = np.array(self.metrics['val'][param]['pred'][-1]) - np.array(self.metrics['val'][param]['true'][-1])
+            sns.kdeplot(errors, label=param)
+        plt.axvline(0, color='r', linestyle='--')
+        plt.xlabel('Prediction Error')
+        plt.ylabel('Density')
+        plt.legend()
+        plt.title('Error Distributions')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def print_metrics(self):
+        print(f"\nBest Validation Loss: {self.best_loss:.4f} at epoch {self.best_epoch}")
+        print("\nFinal Validation Metrics:")
+        for param in self.param_names:
+            print(f"{param}:")
+            print(f"  MAE: {self.metrics['val'][param]['mae'][-1]:.4f}")
+            print(f"  MSE: {self.metrics['val'][param]['mse'][-1]:.4f}")
+            print(f"  R²: {self.metrics['val'][param]['r2'][-1]:.4f}")
+            print(f"  Correlation: {self.metrics['val'][param]['corr'][-1]:.4f}")
+
+# Early Stopping with Model Checkpointing
+class EnhancedEarlyStopping:
+    def __init__(self, patience=10, verbose=True, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.inf
+        self.delta = delta
+        
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'val_loss': val_loss,
+        }, 'best_model.pth')
+        self.val_loss_min = val_loss
+
+# Main Training Function
+def train_genetic_toggle_model():
+    # Load datasets
+    train_dataset = EnhancedGeneticToggleDataset('./data/gene_switch_train.csv', train=True)
+    val_dataset = EnhancedGeneticToggleDataset('./data/gene_switch_test.csv', train=False)
+    
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                            collate_fn=pad_collate, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE,
+                          collate_fn=pad_collate, num_workers=4, pin_memory=True)
+    
+    # Initialize model
+    model = EnhancedGeneticTransformer().to(device)
+    
+    # Optimizer with differential learning rates
+    param_groups = [
+        {'params': [p for n,p in model.named_parameters() if 'epsilon_head' in n], 'lr': FOCUS_LR},
+        {'params': [p for n,p in model.named_parameters() if 'alpha_head' in n], 'lr': FOCUS_LR},
+        {'params': [p for n,p in model.named_parameters() if 'epsilon_head' not in n and 'alpha_head' not in n], 'lr': LR}
+    ]
+    optimizer = optim.AdamW(param_groups, weight_decay=1e-5)
+    
+    # Loss function
+    base_weights = [0.8, 1.2, 3.0, 2.5]  # r, k, epsilon, alpha
+    criterion = DynamicWeightedLoss(base_weights)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=[FOCUS_LR, FOCUS_LR, LR], 
+        epochs=EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3
+    )
+    
+    # Training monitor and early stopping
+    monitor = EnhancedTrainingMonitor(train_dataset.param_names)
+    early_stopping = EnhancedEarlyStopping(patience=PATIENCE, verbose=True)
+    
+    # Training loop
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0.0
+        train_preds = []
+        train_targets = []
+        
+        # Update loss weights based on epoch
+        criterion.update_epoch(epoch)
+        
+        # Training phase
+        train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]")
+        for trajectories, Ts, params, _ in train_bar:
+            trajectories, Ts, params = trajectories.to(device), Ts.to(device), params.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(trajectories, Ts)
+            loss = criterion(outputs, params)
+            loss.backward()
+            
+            # Gradient clipping
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            train_loss += loss.item() * trajectories.size(0)
+            train_preds.append(outputs.detach())
+            train_targets.append(params.detach())
+            train_bar.set_postfix(loss=loss.item())
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_targets = []
+        
+        with torch.no_grad():
+            val_bar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Val]")
+            for trajectories, Ts, params, _ in val_bar:
+                trajectories, Ts, params = trajectories.to(device), Ts.to(device), params.to(device)
+                outputs = model(trajectories, Ts)
+                loss = criterion(outputs, params)
+                val_loss += loss.item() * trajectories.size(0)
+                val_preds.append(outputs)
+                val_targets.append(params)
+                val_bar.set_postfix(loss=loss.item())
+        
+        # Calculate metrics
+        train_loss /= len(train_loader.dataset)
+        val_loss /= len(val_loader.dataset)
+        train_preds = torch.cat(train_preds)
+        train_targets = torch.cat(train_targets)
+        val_preds = torch.cat(val_preds)
+        val_targets = torch.cat(val_targets)
+        
+        # Update monitor
+        monitor.update(
+            epoch+1, train_loss, val_loss, optimizer.param_groups[0]['lr'],
+            train_targets, train_preds, val_targets, val_preds
+        )
+        
+        print(f"\nEpoch {epoch+1}/{EPOCHS} - "
+              f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+              f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Early stopping check
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            print("Early stopping triggered")
+            break
+    
+    # Load best model
+    checkpoint = torch.load('best_model.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Final evaluation
+    model.eval()
+    with torch.no_grad():
+        final_preds = []
+        final_targets = []
+        for trajectories, Ts, params, _ in val_loader:
+            trajectories, Ts, params = trajectories.to(device), Ts.to(device), params.to(device)
+            outputs = model(trajectories, Ts)
+            final_preds.append(outputs)
+            final_targets.append(params)
+        
+        final_preds = torch.cat(final_preds)
+        final_targets = torch.cat(final_targets)
+    
+    # Plot diagnostics
+    monitor.plot_diagnostics()
+    monitor.print_metrics()
+    
+    # Calibration
+    epsilon_pred = final_preds[:,2].cpu().numpy()
+    epsilon_true = final_targets[:,2].cpu().numpy()
+    epsilon_calib = LinearRegression().fit(epsilon_pred.reshape(-1,1), epsilon_true)
+    
+    alpha_pred = final_preds[:,3].cpu().numpy()
+    alpha_true = final_targets[:,3].cpu().numpy()
+    alpha_calib = LinearRegression().fit(alpha_pred.reshape(-1,1), alpha_true)
+    
+    print("\nCalibration Results:")
+    print(f"Epsilon - Slope: {epsilon_calib.coef_[0]:.4f}, Intercept: {epsilon_calib.intercept_:.4f}")
+    print(f"Alpha - Slope: {alpha_calib.coef_[0]:.4f}, Intercept: {alpha_calib.intercept_:.4f}")
+    
+    return model, monitor, (epsilon_calib, alpha_calib)
+
+if __name__ == "__main__":
+    model, monitor, calibrators = train_genetic_toggle_model()
